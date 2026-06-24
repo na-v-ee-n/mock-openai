@@ -133,20 +133,3 @@ accepts any API key, anyone who can reach the port can use it freely.
 Edit `_CANNED_REPLIES` and `_make_reply()` in `mock_openai_server.py` to change
 what the assistant "says". You can make it echo, template, or rule-match inputs
 to simulate different behaviors while you learn.
-
-
-##Test
-A zero-dependency, OpenAI-compatible HTTP API server for learning GenAI offline or behind a corporate firewall. No API key, no internet, no installs — just Python stdlib.
-
-Point any OpenAI client at http://localhost:8000/v1 with any API key. When you're ready for the real service, change base_url and your code stays the same.
-
-Features:
-- Full OpenAI API surface: chat, completions, embeddings, images, audio, moderation, files, fine-tuning, batches, vector stores, assistants, threads, runs, responses
-- Streaming SSE support for chat completions
-- Stateful in-memory CRUD (create/list/retrieve/delete)
-- CORS headers for browser-based clients
-- PATCH support for assistants and threads
-- Configurable simulated latency (--delay flag)
-- Thread-safe concurrent request handling
-- Comprehensive test suite with assertions
-- Security: no outbound connections, no persistent storage, no credential handling
