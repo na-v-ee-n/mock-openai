@@ -35,6 +35,34 @@ the real service later, you only change the `base_url` and use your real key.
    | `--host` | `127.0.0.1` | Bind address |
    | `--port` | `8000` | TCP port |
    | `--delay` | `0.15` | Simulated chat latency in seconds |
+   | `--error-rate` | `0.0` | Probability (0.0–1.0) of injecting a `500` error |
+   | `--rate-limit` | `0` | Max requests/min per client before `429` (0 = off) |
+   | `--max-context-tokens` | `0` | Reject chat over N prompt tokens with `400` (0 = off) |
+   | `--realistic-stream` | off | Variable chunk sizes + jittery streaming latency |
+
+   ### Practising real-world failure handling
+
+   By default the server runs in clean, deterministic mode. The flags above let
+   you simulate the failure modes you **will** hit against the real API, so you
+   can practise handling them offline:
+
+   ```powershell
+   # Force retry/backoff logic: 1 in 5 requests fails with 500
+   python mock_openai_server.py --error-rate 0.2
+
+   # Practise 429 handling + Retry-After header (3 req/min per client)
+   python mock_openai_server.py --rate-limit 3
+
+   # Trigger context_length_exceeded (400) for long prompts
+   python mock_openai_server.py --max-context-tokens 100
+
+   # See realistic streaming chunking and latency
+   python mock_openai_server.py --realistic-stream
+   ```
+
+   - **429** responses include a `Retry-After` header, like the real API.
+   - **400** context errors use `code: "context_length_exceeded"`.
+   - **500** errors use `type: "server_error"` — write retries with backoff.
 
 2. In a second terminal, run a client:
 
@@ -127,6 +155,50 @@ accepts any API key, anyone who can reach the port can use it freely.
 - Do **not** paste a real `sk-...` OpenAI key anywhere in the source files.
 - The `.gitignore` already excludes virtual environments, caches, and IDE
   folders. Check `git status` before your first push.
+
+## What you CAN and CANNOT learn here
+
+This mock is excellent for learning the **API protocol** — how to call endpoints,
+shape requests, parse responses, stream, and handle errors. It is **not** a real
+model, so it cannot teach you anything about model *behaviour*.
+
+If you are a junior dev practising, be clear about the boundary:
+
+### You CAN learn (transferable to the real API)
+
+- **Request/response shapes** — exact JSON for every endpoint
+- **SDK and HTTP client usage** — same code works against real OpenAI
+- **Streaming (SSE)** — parsing `data:` chunks and `[DONE]`
+- **Error handling** — `429` + `Retry-After`, `500` retries, `400` context limits
+  (enable with `--rate-limit`, `--error-rate`, `--max-context-tokens`)
+- **Resource lifecycles** — create / list / retrieve / patch / delete flows
+- **Tool/function-call plumbing** — the `tool_calls` response structure
+
+### You CANNOT learn (needs the real API)
+
+| Skill | Why the mock can't teach it |
+|---|---|
+| **Prompt engineering** | Replies are canned text. Changing your prompt does not change the quality or correctness of the answer. |
+| **Model selection** | `gpt-4o` vs `gpt-3.5` vs `o1` return the same dummy content here. You won't feel their real trade-offs. |
+| **Temperature / sampling** | These params are accepted but ignored — output never actually varies by them. |
+| **Real tool-call reasoning** | The mock always returns a fixed fake tool call; it does not *decide* when or how to call a function. |
+| **Token/cost optimisation** | Token counts are rough estimates and free. You get no real feedback on cost or context budgeting. |
+| **Embeddings quality** | Vectors are random-but-deterministic noise. Similarity search "works" mechanically but is semantically meaningless. |
+| **Hallucination & safety behaviour** | There is no real model, so you can't study refusals, jailbreaks, or factual errors. |
+| **Real latency & throughput** | Simulated delays are approximations, not production performance characteristics. |
+
+### Recommended path for juniors
+
+1. **Build against the mock first** — get your client code, error handling, and
+   plumbing correct without spending a cent.
+2. **Turn on the failure flags** (`--error-rate`, `--rate-limit`,
+   `--max-context-tokens`) and make your code survive them.
+3. **Then switch to the real API** with a small budget (a few dollars) to learn
+   prompting, model selection, and actual output quality — the things only a
+   real model can teach.
+
+Treat this server as a **flight simulator**: perfect for learning the controls
+and emergency procedures, but you still have to fly the real plane eventually.
 
 ## Customizing the fake responses
 

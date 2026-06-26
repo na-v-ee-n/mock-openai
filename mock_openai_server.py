@@ -44,11 +44,36 @@ STORE = {
 }
 STORE_LOCK = threading.Lock()
 
-CONFIG = {"chat_delay": 0.15}  # seconds; set by --delay CLI flag
+# Tunable behaviour, all set from CLI flags in main(). Defaults keep the server
+# deterministic so the existing test suite passes unchanged.
+CONFIG = {
+    "chat_delay": 0.15,          # seconds of fake latency for non-stream chat
+    "error_rate": 0.0,           # 0.0-1.0 chance of injecting a 500 error
+    "rate_limit": 0,             # max requests/min per client (0 = disabled)
+    "max_context_tokens": 0,     # reject chat over this many prompt tokens (0 = off)
+    "realistic_stream": False,   # variable chunk size + jittery latency
+}
+
+# Per-client request timestamps for rate limiting: {client_ip: [epoch, ...]}
+RATE_LOG = {}
+RATE_LOG_LOCK = threading.Lock()
 
 # Sentinel: returned by handlers that already wrote their own HTTP response
 # (e.g. streaming SSE). Distinct from None, which signals "resource not found".
 _STREAMED = object()
+
+
+class APIError(Exception):
+    """Raised by handlers to emit an OpenAI-style error with a chosen status."""
+
+    def __init__(self, message, status=400, err_type="invalid_request_error",
+                 code=None, headers=None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.err_type = err_type
+        self.code = code
+        self.headers = headers or {}
 
 
 def now() -> int:
@@ -179,8 +204,18 @@ def chat_stream_chunks(model, messages):
         }
 
     yield frame({"role": "assistant", "content": ""})
-    for word in reply.split(" "):
-        yield frame({"content": word + " "})
+    words = reply.split(" ")
+    if CONFIG["realistic_stream"]:
+        # Real OpenAI emits variable-sized chunks (1-3 tokens), not 1 word each.
+        i = 0
+        while i < len(words):
+            take = random.randint(1, 3)
+            chunk = " ".join(words[i:i + take]) + " "
+            yield frame({"content": chunk})
+            i += take
+    else:
+        for word in words:
+            yield frame({"content": word + " "})
     yield frame({}, finish_reason="stop")
 
 
@@ -406,6 +441,20 @@ def h_model_get(h, body, model):
 def h_chat(h, body):
     model = body.get("model", "gpt-4o-mini")
     messages = body.get("messages", [])
+
+    limit = CONFIG["max_context_tokens"]
+    if limit:
+        prompt_tokens = sum(_estimate_tokens(m.get("content", ""))
+                            for m in messages)
+        if prompt_tokens > limit:
+            raise APIError(
+                f"This model's maximum context length is {limit} tokens, "
+                f"however your messages resulted in {prompt_tokens} tokens. "
+                f"Please reduce the length of the messages.",
+                status=400, err_type="invalid_request_error",
+                code="context_length_exceeded",
+            )
+
     if body.get("stream"):
         h.stream_sse(chat_stream_chunks(model, messages))
         return _STREAMED
@@ -773,9 +822,50 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_error(self, message, status=400, err_type="invalid_request_error"):
-        self._send_json({"error": {"message": message, "type": err_type,
-                                   "param": None, "code": None}}, status=status)
+    def _send_error(self, message, status=400, err_type="invalid_request_error",
+                    code=None, extra_headers=None):
+        body = json.dumps({"error": {"message": message, "type": err_type,
+                                     "param": None, "code": code}}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, str(v))
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- simulated failure modes (opt-in via CLI flags) --
+    def _check_rate_limit(self):
+        limit = CONFIG["rate_limit"]
+        if not limit:
+            return
+        client = self.client_address[0]
+        cutoff = time.time() - 60
+        with RATE_LOG_LOCK:
+            hits = [t for t in RATE_LOG.get(client, []) if t > cutoff]
+            if len(hits) >= limit:
+                retry = max(1, int(60 - (time.time() - hits[0])))
+                RATE_LOG[client] = hits
+                raise APIError(
+                    f"Rate limit reached for requests. Limit: {limit} / min. "
+                    f"Please try again in {retry}s.",
+                    status=429, err_type="rate_limit_error",
+                    code="rate_limit_exceeded",
+                    headers={"Retry-After": retry},
+                )
+            hits.append(time.time())
+            RATE_LOG[client] = hits
+
+    def _maybe_inject_error(self):
+        rate = CONFIG["error_rate"]
+        if rate and random.random() < rate:
+            raise APIError(
+                "The server had an error while processing your request. "
+                "Sorry about that! (simulated)",
+                status=500, err_type="server_error",
+                code="internal_error",
+            )
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -796,11 +886,13 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self._cors_headers()
         self.end_headers()
+        realistic = CONFIG["realistic_stream"]
         try:
             for chunk in chunks:
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
-                time.sleep(0.04)
+                # Real streams have jittery inter-chunk latency, not a fixed tick.
+                time.sleep(random.uniform(0.01, 0.2) if realistic else 0.04)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -823,7 +915,16 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                 continue
             match = rx.match(path)
             if match:
-                result = func(self, body, **match.groupdict())
+                try:
+                    # Opt-in failure simulations run before the handler.
+                    self._check_rate_limit()
+                    self._maybe_inject_error()
+                    result = func(self, body, **match.groupdict())
+                except APIError as exc:
+                    self._send_error(exc.message, status=exc.status,
+                                     err_type=exc.err_type, code=exc.code,
+                                     extra_headers=exc.headers)
+                    return
                 if result is _STREAMED:
                     return  # handler already wrote the full response
                 if result is None:
@@ -869,8 +970,28 @@ def main():
         "--delay", type=float, default=0.15, metavar="SECONDS",
         help="Simulated latency for non-streaming chat responses (default: 0.15s)",
     )
+    parser.add_argument(
+        "--error-rate", type=float, default=0.0, metavar="0.0-1.0",
+        help="Probability of injecting a 500 server error (default: 0 = off)",
+    )
+    parser.add_argument(
+        "--rate-limit", type=int, default=0, metavar="N",
+        help="Max requests/min per client before 429 (default: 0 = off)",
+    )
+    parser.add_argument(
+        "--max-context-tokens", type=int, default=0, metavar="N",
+        help="Reject chat requests over N prompt tokens with 400 (default: 0 = off)",
+    )
+    parser.add_argument(
+        "--realistic-stream", action="store_true",
+        help="Variable chunk sizes and jittery latency in streamed responses",
+    )
     args = parser.parse_args()
     CONFIG["chat_delay"] = args.delay
+    CONFIG["error_rate"] = args.error_rate
+    CONFIG["rate_limit"] = args.rate_limit
+    CONFIG["max_context_tokens"] = args.max_context_tokens
+    CONFIG["realistic_stream"] = args.realistic_stream
 
     server = ThreadingHTTPServer((args.host, args.port), MockOpenAIHandler)
     base = f"http://{args.host}:{args.port}/v1"
@@ -883,6 +1004,16 @@ def main():
     print("  API key  : anything works (e.g. 'mock-key')")
     print(f"  Routes   : {len(ROUTES)} endpoints registered")
     print(f"  Delay    : {args.delay}s (chat non-stream)")
+    _sims = []
+    if args.error_rate:
+        _sims.append(f"error-rate={args.error_rate}")
+    if args.rate_limit:
+        _sims.append(f"rate-limit={args.rate_limit}/min")
+    if args.max_context_tokens:
+        _sims.append(f"max-context={args.max_context_tokens}tok")
+    if args.realistic_stream:
+        _sims.append("realistic-stream")
+    print(f"  Sims     : {', '.join(_sims) if _sims else 'none (clean mode)'}")
     if _network_exposed:
         print("  " + "!" * 60)
         print(f"  WARNING: Listening on {args.host} — server is reachable")
